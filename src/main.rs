@@ -2,6 +2,7 @@
 use std::net::TcpListener;
 use std::io::Read;
 use std::io::Write;
+use std::thread;
 
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -13,22 +14,29 @@ fn main() {
     
     for stream in listener.incoming() {
         match stream {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 println!("accepted new connection");
-                let mut buffer = [0; 512];
-
-                loop {
-                    let n = stream.read(&mut buffer).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    stream.write(b"+PONG\r\n").unwrap();
-                    stream.flush().unwrap();
-                }
+                thread::spawn(move || handle_connection(stream));
             }
             Err(e) => {
                 println!("error: {}", e);
             }
         }
     }
+}
+
+fn handle_connection(mut stream: std::net::TcpStream) {
+    let mut buffer = [0; 512];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break, // Connection closed
+            Ok(_) => {
+                if stream.write(b"+PONG\r\n").is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    println!("Connection closed");
 }
