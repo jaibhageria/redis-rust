@@ -5,6 +5,7 @@ use std::io::Write;
 use std::thread;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use lazy_static::lazy_static;
 
 #[derive(Debug)]
@@ -24,7 +25,7 @@ enum RedisValue {
 }
 
 lazy_static! {
-    static ref STORE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+    static ref STORE: Mutex<HashMap<String, (String, u64)>> = Mutex::new(HashMap::new());
 }
 
 fn main() {
@@ -204,10 +205,42 @@ fn handle_redis_command(stream: &mut std::net::TcpStream, args: &[RedisValue]) -
             }
 
             if let (RedisValue::BulkString(key), RedisValue::BulkString(value)) = (&args[1], &args[2]) {
-                if let Some(old_value) = STORE.lock().unwrap().insert(key.clone(), value.clone()) {
-                    println!("Updated key: {}; Old value: {}; New value: {}", key, old_value, value);
+                if args.len() > 3 {
+                    if let RedisValue::BulkString(option) = &args[3] {
+                        if option.to_uppercase() == "PX" {
+                            if args.len() >= 4 {
+                                if let RedisValue::BulkString(expiry_str) = &args[4] {
+                                    if let Ok(expiry_ms) = expiry_str.parse::<u64>() {
+                                        let expiry_time = get_current_timestamp_ms() + expiry_ms;
+                                        STORE.lock().unwrap().insert(key.clone(), (value.clone(), expiry_time));
+                                        println!("Set key: {} with expiry in {} ms", key, expiry_ms);
+                                        send_resp_simple_string(stream, "OK")?;
+                                        return Ok(());
+                                    } else {
+                                        send_error(stream, "ERR invalid PX value")?;
+                                        return Ok(());
+                                    }
+                                } else {
+                                    send_error(stream, "ERR invalid PX argument type")?;
+                                    return Ok(());
+                                }
+                            } else {
+                                send_error(stream, "ERR PX requires an argument")?;
+                                return Ok(());
+                            }
+                        } else {
+                            send_error(stream, "ERR unknown option")?;
+                            return Ok(());
+                        }
+                    } else {
+                        send_error(stream, "ERR invalid option type")?;
+                        return Ok(());
+                    }
+                }
+                if let Some((old_value, ts)) = STORE.lock().unwrap().insert(key.clone(), (value.clone(), 0)) {
+                    println!("Updated key: {}; Old value: {} (ts: {}); New value: {} (ts: {})", key, old_value, ts, value.clone(), 0);
                 } else {
-                    println!("Set new key: {}; New value: {}", key, value);
+                    println!("Set new key: {}; New value: {} (ts: {})", key, value.clone(), 0);
                 }
                 send_resp_simple_string(stream, "OK")?;
             } else {
@@ -221,10 +254,16 @@ fn handle_redis_command(stream: &mut std::net::TcpStream, args: &[RedisValue]) -
             }
 
             if let RedisValue::BulkString(key) = &args[1] {
-                let value = STORE.lock().unwrap().get(key).cloned();
-                match value {
-                    Some(value) => {
-                        send_resp_bulk_string(stream, value)?;
+                let entry = STORE.lock().unwrap().get(key).map(|(v, ts)| (v.clone(), ts.clone()));
+                match entry {
+                    Some((value, _ts)) => {
+                        let current_time = get_current_timestamp_ms();
+                        if _ts == 0 || current_time <= _ts {
+                            send_resp_bulk_string(stream, value)?;
+                        } else {
+                            STORE.lock().unwrap().remove(key);
+                            send_resp_bulk_string(stream, "".to_string())?;
+                        }
                     }
                     None => {
                         // Send null bulk string
@@ -267,4 +306,11 @@ fn send_resp_bulk_string(stream: &mut std::net::TcpStream, message: String) -> R
     stream.write_all(response.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+fn get_current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis() as u64
 }
